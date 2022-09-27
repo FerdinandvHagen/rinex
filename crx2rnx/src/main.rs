@@ -1,11 +1,12 @@
-//! crx2rnx: 
-//! command line tool to compress RINEX files   
-//! and decompress CRINEX files
+//! Command line tool to decompress CRINEX files 
 use rinex::{header, hatanaka};
+use rinex::hatanaka::Decompressor;
 use rinex::reader::BufferedReader;
 
-use clap::App;
-use clap::load_yaml;
+use clap::{
+    App, AppSettings,
+    load_yaml,
+};
 use thiserror::Error;
 use std::io::{Write, BufRead};
 
@@ -15,35 +16,31 @@ enum Error {
     IoError(#[from] std::io::Error),
     #[error("failed to parse RINEX header")]
     ParseHeaderError(#[from] header::Error),
-    #[error("hatanaka error")]
-    HatanakaError(#[from] hatanaka::Error),
+    #[error("decompression error")]
+    DecompressionError(#[from] hatanaka::Error),
 }
 
 fn main() -> Result<(), Error> {
     let yaml = load_yaml!("cli.yml");
-    let app = App::from_yaml(yaml);
+    let app = App::from_yaml(yaml)
+        .setting(AppSettings::ArgRequiredElseHelp);
     let matches = app.get_matches();
     let filepath = matches.value_of("filepath")
         .unwrap();
-    let m = u16::from_str_radix(matches.value_of("m")
-        .unwrap_or("8"),10).unwrap();
-    let _strict_flag = matches.is_present("strict");
 
-    let mut default_output = String::from("output.crx");
-    if filepath.ends_with("d") { // CRNX < 3
-        default_output = filepath.strip_suffix("d")
-            .unwrap()
-            .to_owned() + "o";
-    } else if filepath.ends_with(".crx") { // CRNX >= 3
-        default_output = filepath.strip_suffix(".crx")
-            .unwrap()
-            .to_owned() + ".rnx";
+    let mut outpath = String::from("output.crx");
+    if let Some(prefix) = filepath.strip_suffix("d") { // CRNX1
+        outpath = prefix.to_owned() + "o" // RNX1
+    } else {
+        if let Some(prefix) = filepath.strip_suffix(".crx") { // CRNX3
+            outpath = prefix.to_owned() + "rnx" // RNX3
+        }
     }
 
     let outpath : String = String::from(matches.value_of("output")
-        .unwrap_or(&default_output));
+        .unwrap_or(&outpath));
     let output = std::fs::File::create(outpath.clone())?;
-    decompress(filepath, m, output)?;
+    decompress(filepath, output)?;
     println!("{} generated", outpath);
     Ok(())
 }
@@ -52,7 +49,7 @@ fn main() -> Result<(), Error> {
 /// fp : filepath   
 /// m : maximal compression order for core algorithm    
 /// writer: stream
-fn decompress (fp: &str, m: u16, mut writer: std::fs::File) -> Result<(), Error> {
+fn decompress (fp: &str, mut writer: std::fs::File) -> Result<(), Error> {
     // BufferedReader is not efficient enough (at the moment) to
     // perform the Hatanaka decompression by itself, but we'll get there..
     // BufferedReader supports .gzip stream decompression and efficient .line() browsing.
@@ -61,8 +58,8 @@ fn decompress (fp: &str, m: u16, mut writer: std::fs::File) -> Result<(), Error>
     for line in reader.lines() {
         let l = &line.unwrap();
         if !inside_crinex {
-            write!(writer, "{}\n", l)?; // push header fields as is, 
-                    // because they are not compressed :)
+            // push header fields as is
+            write!(writer, "{}\n", l)?
         }
         if l.contains("CRINEX PROG / DATE") {
             inside_crinex = false
@@ -75,17 +72,21 @@ fn decompress (fp: &str, m: u16, mut writer: std::fs::File) -> Result<(), Error>
     // we need them to determine things when decompressing the record
     let mut reader = BufferedReader::new(fp)?;
     let header = header::Header::new(&mut reader)?;
-    // parse / decompress / produce file body
-    let mut decompressor = hatanaka::Decompressor::new(m.into());
+    // decompress file body
+    let mut decompressor = Decompressor::new();
     for l in reader.lines() {
         let line = &l.unwrap();
-        let mut content = line.to_string();
-        if content.len() == 0 {
-            content = String::from(" ");
+        if line.len() == 0 {
+            // sometimes we run into empty lines
+            // like omitted clock offset fields,
+            // and decompress() does not like it
+            println!("read an empty line <<<<<<<<<<<<<<<<<<<<<<<<<<\n");
+            let recovered = decompressor.decompress(&header, "\n")?;
+            write!(writer, "{}", recovered)?
+        } else {
+            let recovered = decompressor.decompress(&header, line)?;
+            write!(writer, "{}", recovered)?
         }
-        println!("body \"{}\"", content);
-        let recovered = decompressor.decompress(&header, &content)?;
-        write!(writer, "{}", recovered)?
     }
     Ok(())
 }
@@ -94,8 +95,8 @@ fn decompress (fp: &str, m: u16, mut writer: std::fs::File) -> Result<(), Error>
 mod test {
     use assert_cmd::prelude::*;
     use std::process::Command;
-    /// Runs `diff` to determine whether f1 & f2 
-    /// are strictly identical or not. Whitespaces are omitted
+    // Runs `diff` to determine whether f1 & f2 
+    // are strictly identical or not. Whitespaces are omitted
     fn diff_is_strictly_identical (f1: &str, f2: &str) -> Result<bool, std::string::FromUtf8Error> {
         let output = Command::new("diff")
             .arg("-q")
@@ -107,12 +108,13 @@ mod test {
         let output = String::from_utf8(output.stdout)?;
         Ok(output.len()==0)
     }
-    /// The test bench consists in calling `crx2rnx` as is,
-    /// on each /CRNX/Vx test resource where
-    /// we do have an /OBS/Vy counterpart.
-    /// We uncompress the file and perform a `file diff` which
-    /// must returns 0. The hidden trick: /CRNX/Vx and its counterpart
-    /// comprise the same epoch content
+    // The test bench consists in calling `crx2rnx` as is,
+    // on each /CRNX/Vx test resource where
+    // we do have an /OBS/Vy counterpart.
+    // We uncompress the file and perform a `file diff` which
+    // must returns 0. The hidden trick: /CRNX/Vx and its counterpart
+    // comprise the same epoch content and the counterpart was
+    // decompressed using the official binary.
     #[test]
     fn test_decompression_v1()  -> Result<(), Box<dyn std::error::Error>> { 
         let test_resources = env!("CARGO_MANIFEST_DIR").to_owned() 
@@ -165,12 +167,13 @@ mod test {
         let _ = std::fs::remove_file("testv1.rnx");
         Ok(())
     }
-    /// The test bench consists in calling `crx2rnx` as is,
-    /// on each /CRNX/Vx test resource where
-    /// we do have an /OBS/Vy counterpart.
-    /// We uncompress the file and perform a `file diff` which
-    /// must returns 0. The hidden trick: /CRNX/Vx and its counterpart
-    /// comprise the same epoch content
+    // The test bench consists in calling `crx2rnx` as is,
+    // on each /CRNX/Vx test resource where
+    // we do have an /OBS/Vy counterpart.
+    // We uncompress the file and perform a `file diff` which
+    // must returns 0. The hidden trick: /CRNX/Vx and its counterpart
+    // comprise the same epoch content and the counterpart was
+    // decompressed using the official binary.
     #[test]
     fn test_decompression_v3()  -> Result<(), Box<dyn std::error::Error>> {
         let test_resources = env!("CARGO_MANIFEST_DIR").to_owned() 

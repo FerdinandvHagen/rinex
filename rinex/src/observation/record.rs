@@ -1,18 +1,26 @@
 //! `ObservationData` parser and related methods
-use std::io::Write;
 use thiserror::Error;
 use std::str::FromStr;
-use chrono::Timelike;
+//use chrono::Timelike;
 use bitflags::bitflags;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::sv;
+use crate::sv::Sv;
+
 use crate::epoch;
+use crate::epoch::Epoch;
+
 use crate::header;
+use crate::header::Header;
+
 use crate::version;
 use crate::constellation;
 use crate::constellation::Constellation;
 use crate::constellation::augmentation::Augmentation;
+
+use std::io::Write;
+use crate::writer::BufferedWriter;
 
 #[cfg(feature = "serde")]
 use serde::Serialize;
@@ -31,7 +39,7 @@ pub enum Ssi {
     /// 18 dB/Hz <= Ssi < 23 dB/Hz
     DbHz18_23 = 3, 
     /// 24 dB/Hz <= Ssi < 29 dB/Hz
-    DbHz21_29 = 4, 
+    DbHz24_29 = 4, 
     /// 30 dB/Hz <= Ssi < 35 dB/Hz
     DbHz30_35 = 5, 
     /// 36 dB/Hz <= Ssi < 41 dB/Hz
@@ -42,6 +50,23 @@ pub enum Ssi {
     DbHz48_53 = 8, 
     /// Ssi >= 54 dB/Hz 
     DbHz54 = 9, 
+}
+
+impl std::fmt::Display for Ssi {
+    fn fmt (&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::DbHz0 => "0".fmt(f),
+            Self::DbHz12 => "1".fmt(f),
+            Self::DbHz12_17 => "2".fmt(f),
+            Self::DbHz18_23 => "3".fmt(f),
+            Self::DbHz24_29 => "4".fmt(f),
+            Self::DbHz30_35 => "5".fmt(f),
+            Self::DbHz36_41 => "6".fmt(f),
+            Self::DbHz42_47 => "7".fmt(f),
+            Self::DbHz48_53 => "8".fmt(f),
+            Self::DbHz54 => "9".fmt(f),
+        }
+    }
 }
 
 impl Default for Ssi {
@@ -56,7 +81,7 @@ impl FromStr for Ssi {
             "1" => Ok(Ssi::DbHz12),
             "2" => Ok(Ssi::DbHz12_17),
             "3" => Ok(Ssi::DbHz18_23),
-            "4" => Ok(Ssi::DbHz21_29),
+            "4" => Ok(Ssi::DbHz24_29),
             "5" => Ok(Ssi::DbHz30_35),
             "6" => Ok(Ssi::DbHz36_41),
             "7" => Ok(Ssi::DbHz42_47),
@@ -220,7 +245,7 @@ pub fn is_new_epoch (line: &str, v: version::Version) -> bool {
 
 /// Builds `Record` entry for `ObservationData`
 /// from given epoch content
-pub fn build_record_entry (header: &header::Header, content: &str)
+pub fn parse_epoch (header: &header::Header, content: &str)
         -> Result<(epoch::Epoch, Option<f64>, BTreeMap<sv::Sv, HashMap<String, ObservationData>>), Error> 
 {
     let mut lines = content.lines();
@@ -536,8 +561,126 @@ pub fn build_record_entry (header: &header::Header, content: &str)
     Ok((epoch, clock_offset, map))
 }
 
-/// Pushes observation record into given file writer
-pub fn to_file (header: &header::Header, record: &Record, mut writer: std::fs::File) -> std::io::Result<()> {
+/// Writes epoch into given streamer 
+pub fn write_epoch (
+        epoch: &Epoch,
+        clock_offset: &Option<f64>,
+        data: &BTreeMap<Sv, HashMap<String, ObservationData>>,
+        header: &Header,
+        writer: &mut BufferedWriter,
+    ) -> std::io::Result<()> {
+    if header.version.major < 3 {
+        write_epoch_v2(epoch, clock_offset, data, header, writer)
+    } else {
+        write_epoch_v3(epoch, clock_offset, data, header, writer)
+    }
+}
+
+fn write_epoch_v3(
+        epoch: &Epoch,
+        clock_offset: &Option<f64>,
+        data: &BTreeMap<Sv, HashMap<String, ObservationData>>,
+        header: &Header,
+        writer: &mut BufferedWriter,
+    ) -> std::io::Result<()> {
+    let mut lines = String::new();
+    let obscodes = &header.obs
+        .as_ref()
+        .unwrap()
+        .codes;
+    lines.push_str("> ");
+    lines.push_str(&epoch.to_string_obs_v3());
+    lines.push_str(&format!("{:3}", data.len()));
+    if let Some(data) = clock_offset {
+        lines.push_str(&format!("{:12.4}", data)); 
+    }
+    lines.push_str("\n");
+    
+    for (sv, data) in data.iter() {
+        lines.push_str(&format!("{} ", sv.to_string()));
+        if let Some(obscodes) = obscodes.get(&sv.constellation) {
+            for code in obscodes {
+                if let Some(observation) = data.get(code) {
+                    lines.push_str(&format!(" {:10.3}", observation.obs));
+                    if let Some(flag) = observation.lli {
+                        lines.push_str(&format!("{}", flag.bits()));
+                    } else {
+                        lines.push_str(" ");
+                    }
+                    if let Some(flag) = observation.ssi {
+                        lines.push_str(&format!("{}", flag));
+                    } else {
+                        lines.push_str(" ");
+                    }
+                } else {
+                    lines.push_str(&format!("               "));
+                }
+            }
+        }
+        lines.push_str("\n");
+    }
+
+    write!(writer, "{}", lines)
+}
+
+fn write_epoch_v2(
+        epoch: &Epoch,
+        clock_offset: &Option<f64>,
+        data: &BTreeMap<Sv, HashMap<String, ObservationData>>,
+        header: &Header,
+        writer: &mut BufferedWriter,
+    ) -> std::io::Result<()> {
+    let mut lines = String::new();
+    let obscodes = &header.obs
+        .as_ref()
+        .unwrap()
+        .codes;
+    lines.push_str(" ");
+    lines.push_str(&epoch.to_string_obs_v2());
+    lines.push_str(&format!("{:3}", data.len()));
+    let mut index = 0;
+    for (sv, _) in data {
+        index += 1;
+        if (index %13) == 0 {
+            if let Some(data) = clock_offset {
+                lines.push_str(&format!(" {:9.1}", data));
+            }
+            lines.push_str("\n                                ");
+        }
+        lines.push_str(&sv.to_string());
+    }
+    for (_, observations) in data.iter() {
+        let mut index = 0;
+        lines.push_str("\n ");
+        for (_, codes) in obscodes {
+            for code in codes {
+                index += 1;
+                if let Some(observation) = observations.get(code) {
+                    lines.push_str(&format!(" {:10.3}", observation.obs));
+                    if let Some(flag) = observation.lli {
+                        lines.push_str(&format!("{}", flag.bits()));
+                    } else {
+                        lines.push_str(" ");
+                    }
+                    if let Some(flag) = observation.ssi {
+                        lines.push_str(&format!("{}", flag));
+                    } else {
+                        lines.push_str(" ");
+                    }
+                } else {
+                    lines.push_str(&format!("               "));
+                }
+                if (index % 5) == 0 {
+                    lines.push_str("\n");
+                }
+            }
+            break // iterate obscodes only once
+        }
+    }
+    lines.push_str("\n");
+    write!(writer, "{}", lines)
+}
+/*
     for (epoch, (clock_offset, sv)) in record.iter() {
         let date = epoch.date;
         let flag = epoch.flag;
@@ -625,8 +768,7 @@ pub fn to_file (header: &header::Header, record: &Record, mut writer: std::fs::F
             write!(writer, "\n")?
         }
     }
-    Ok(())
-}
+*/
 
 #[cfg(test)]
 mod test {

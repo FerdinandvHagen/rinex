@@ -1,5 +1,4 @@
 //! `NavigationData` parser and related methods
-use std::io::Write;
 use thiserror::Error;
 use std::str::FromStr;
 use strum_macros::EnumString;
@@ -11,90 +10,15 @@ use crate::sv;
 use crate::sv::Sv;
 use crate::epoch::{Epoch, ParseDateError};
 use crate::version::Version;
-use crate::navigation::database;
 use crate::constellation::Constellation;
-use crate::navigation::database::NAV_MESSAGES;
-use crate::navigation::ionmessage;
-use crate::navigation::stomessage;
-use crate::navigation::eopmessage;
 
-/// `ComplexEnum` is record payload 
-#[derive(Clone, Debug)]
-#[derive(PartialEq, PartialOrd)]
-#[cfg_attr(feature = "serde", derive(Serialize))]
-pub enum ComplexEnum {
-    U8(u8),
-    Str(String), 
-    F32(f32),
-    F64(f64),
-}
+use crate::navigation::{
+    ionmessage, stomessage, eopmessage,
+    database, database::{NAV_MESSAGES, DbItem, DbItemError},
+};
 
-impl std::fmt::Display for ComplexEnum {
-    fn fmt (&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            ComplexEnum::U8(u)  => write!(fmt, "{:X}", u),
-            ComplexEnum::Str(s) => write!(fmt, "{}", s),
-            ComplexEnum::F32(f) => write!(fmt, "{:.10e}", f),
-            ComplexEnum::F64(f) => write!(fmt, "{:.10e}", f),
-        }
-    }
-}
-
-/// `ComplexEnum` related errors
-#[derive(Error, Debug)]
-pub enum ComplexEnumError {
-    #[error("failed to parse int value")]
-    ParseIntError(#[from] std::num::ParseIntError),
-    #[error("failed to parse float value")]
-    ParseFloatError(#[from] std::num::ParseFloatError),
-    #[error("unknown type descriptor \"{0}\"")]
-    UnknownTypeDescriptor(String),
-}
-
-impl ComplexEnum {
-    /// Builds a `ComplexEnum` from type descriptor and string content
-    pub fn new (desc: &str, content: &str) -> Result<ComplexEnum, ComplexEnumError> {
-        match desc {
-            "f32" => {
-                Ok(ComplexEnum::F32(f32::from_str(&content.replace("D","e"))?))
-            },
-            "f64" => {
-                Ok(ComplexEnum::F64(f64::from_str(&content.replace("D","e"))?))
-            },
-            "u8" => {
-                Ok(ComplexEnum::U8(u8::from_str_radix(&content, 16)?))
-            },
-            "str" => {
-                Ok(ComplexEnum::Str(String::from(content)))
-            },
-            _ => Err(ComplexEnumError::UnknownTypeDescriptor(desc.to_string())),
-        }
-    }
-    pub fn as_f32 (&self) -> Option<f32> {
-        match self {
-            ComplexEnum::F32(f) => Some(f.clone()),
-            _ => None,
-        }
-    }
-    pub fn as_f64 (&self) -> Option<f64> {
-        match self {
-            ComplexEnum::F64(f) => Some(f.clone()),
-            _ => None,
-        }
-    }
-    pub fn as_str (&self) -> Option<String> {
-        match self {
-            ComplexEnum::Str(s) => Some(s.clone()),
-            _ => None,
-        }
-    }
-    pub fn as_u8 (&self) -> Option<u8> {
-        match self {
-            ComplexEnum::U8(u) => Some(u.clone()),
-            _ => None,
-        }
-    }
-}
+use std::io::Write;
+use crate::writer::BufferedWriter;
 
 /// Possible Navigation Frame declinations for an epoch
 #[derive(Debug, Copy, Clone)]
@@ -103,13 +27,13 @@ impl ComplexEnum {
 #[derive(EnumString)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum FrameClass {
-    #[strum(serialize = "EPH", deserialize = "EPH")]
+    #[strum(serialize = "EPH")]
     Ephemeris,
-    #[strum(serialize = "STO", deserialize = "STO")]
+    #[strum(serialize = "STO")]
     SystemTimeOffset,
-    #[strum(serialize = "EOP", deserialize = "EOP")]
+    #[strum(serialize = "EOP")]
     EarthOrientation,
-    #[strum(serialize = "ION", deserialize = "ION")]
+    #[strum(serialize = "ION")]
     IonosphericModel,
 }
 
@@ -186,7 +110,7 @@ pub enum Frame {
     /// with vehicule internal clock bias, clock drift and clock drift rate.
     /// Rest of data is constellation dependent, see
     /// RINEX specifications or db/NAV/navigation.json.
-    Eph(MsgType, Sv, f64, f64, f64, HashMap<String, ComplexEnum>),
+    Eph(MsgType, Sv, f64, f64, f64, HashMap<String, DbItem>),
     /// Earth Orientation Parameters message 
     Eop(eopmessage::Message),
     /// Ionospheric Model Message
@@ -197,14 +121,14 @@ pub enum Frame {
 
 impl Frame {
     /// Unwraps self as Ephemeris frame
-    pub fn as_eph (&self) -> Option<(MsgType, Sv, f64, f64, f64, &HashMap<String, ComplexEnum>)> {
+    pub fn as_eph (&self) -> Option<(MsgType, Sv, f64, f64, f64, &HashMap<String, DbItem>)> {
         match self {
             Self::Eph(msg, sv, clk, clk_dr, clk_drr, map) => Some((*msg, *sv, *clk, *clk_dr, *clk_drr, map)),
             _ => None,
         }
     }
     /// Unwraps self as mutable Ephemeris frame reference
-    pub fn as_mut_eph (&mut self) -> Option<(&mut MsgType, &mut Sv, &mut f64, &mut f64, &mut f64, &mut HashMap<String, ComplexEnum>)> {
+    pub fn as_mut_eph (&mut self) -> Option<(&mut MsgType, &mut Sv, &mut f64, &mut f64, &mut f64, &mut HashMap<String, DbItem>)> {
         match self {
             Self::Eph(msg, sv, clk, clk_dr, clk_drr, map) => Some((msg, sv, clk, clk_dr, clk_drr, map)),
             _ => None,
@@ -308,7 +232,7 @@ pub enum Error {
     #[error("failed to parse msg type")]
     SvError(#[from] sv::Error),
     #[error("failed to parse cplx data")]
-    ParseComplexError(#[from] ComplexEnumError),
+    ParseComplexError(#[from] DbItemError),
     #[error("failed to parse sv::prn")]
     ParseIntError(#[from] std::num::ParseIntError), 
     #[error("failed to parse sv clock fields")]
@@ -324,7 +248,7 @@ pub enum Error {
 }
 
 /// Builds `Record` entry for `NavigationData`
-pub fn build_record_entry (version: Version, constell: Constellation, content: &str) ->
+pub fn parse_epoch (version: Version, constell: Constellation, content: &str) ->
         Result<(Epoch, FrameClass, Frame), Error>
 {
     if content.starts_with(">") {
@@ -502,7 +426,7 @@ fn build_v2_v3_record_entry (version: Version, constell: Constellation, content:
 
 /// Parses constellation + revision dependent complex map 
 fn parse_complex_map (version: Version, constell: Constellation, mut lines: std::str::Lines<'_>) 
-        -> Result<HashMap<String, ComplexEnum>, Error>
+        -> Result<HashMap<String, DbItem>, Error>
 {
     // locate closest revision in db
     let db_revision = match database::closest_revision(constell, version) {
@@ -534,7 +458,7 @@ fn parse_complex_map (version: Version, constell: Constellation, mut lines: std:
     };
     let mut new_line = true;
     let mut total :usize = 0;
-    let mut map :HashMap<String, ComplexEnum> = HashMap::new();
+    let mut map :HashMap<String, DbItem> = HashMap::new();
     for item in items.iter() {
         let (k, v) = item;
         let offset :usize = match new_line {
@@ -554,9 +478,7 @@ fn parse_complex_map (version: Version, constell: Constellation, mut lines: std:
             line = rem.clone();
 
             if !k.contains(&"spare") { // --> got something to parse in db
-                if let Ok(cplx) = ComplexEnum::new(v, content.trim()) {
-                    // parsing did work,
-                    // data is provided
+                if let Ok(cplx) = DbItem::new(v, content.trim(), constell) {
                     map.insert(k.to_string(), cplx);
                 }
             }
@@ -583,9 +505,98 @@ fn parse_complex_map (version: Version, constell: Constellation, mut lines: std:
     Ok(map)
 }
 
+/// Writes given epoch into stream 
+pub fn write_epoch (
+        epoch: &Epoch, 
+        data: &BTreeMap<FrameClass, Vec<Frame>>,
+        header: &header::Header,
+        writer: &mut BufferedWriter,
+    ) -> std::io::Result<()> {
+    /*if header.version.major < 3 {*/
+        write_epoch_v2(epoch, data, header, writer)
+    /*} else if header.version.major == 3 {
+        write_epoch_v2(epoch, data, header, writer)
+    } else {
+        write_epoch_v2(epoch, data, header, writer)
+    }*/
+}
 
-/// Pushes observation record into given file writer
-pub fn to_file (header: &header::Header, record: &Record, mut writer: std::fs::File) -> std::io::Result<()> {
+fn write_epoch_v2 (
+        epoch: &Epoch, 
+        data: &BTreeMap<FrameClass, Vec<Frame>>,
+        header: &header::Header,
+        writer: &mut BufferedWriter,
+    ) -> std::io::Result<()> {
+    let mut lines = String::new();
+    for (class, frames) in data.iter() {
+        if *class == FrameClass::Ephemeris {
+            for frame in frames.iter() {
+                let (_, sv, clk_off, clk_dr, clk_drr, data) = frame.as_eph()
+                    .unwrap();
+                match &header.constellation {
+                    Some(Constellation::Mixed) => lines.push_str(&sv.to_string()),
+                    Some(_) => lines.push_str(&format!("{:2} ", sv.prn)),
+                    None => {},
+                }
+                lines.push_str(&epoch.to_string_nav_v2());
+                lines.push_str(&format!("{:.14e}", clk_off));
+                lines.push_str(&format!("{:.14e}", clk_dr));
+                lines.push_str(&format!("{:.14e}", clk_drr));
+                let mut index = 3;
+                for (_, data) in data.iter() {
+                    index += 1;
+                    if let Some(data) = data.as_f64() {
+                        lines.push_str(&format!("{:.14e}", data));
+                    } else {
+                        lines.push_str("                ");
+                    }
+                    if (index % 4) == 0 {
+                        lines.push_str("\n");
+                    }
+                }
+            }
+        }
+    }
+    lines = lines.replace("e-", "D-");
+    lines = lines.replace("e", "D+");
+    lines.push_str("\n");
+    write!(writer, "{}", lines)
+}
+
+/*
+fn write_epoch_v3 (
+        epoch: &Epoch, 
+        data: &BTreeMap<FrameClass, Vec<Frame>>,
+        header: &header::Header,
+        writer: &mut BufferedWriter,
+    ) -> std::io::Result<()> {
+    let mut lines = String::new();
+    lines.push_str(" ");
+    lines.push_str(&epoch.to_string_nav_v2());
+    for (class, frames) in data.iter() {
+        if *class == FrameClass::Ephemeris {
+            for frame in frames.iter() {
+                let (_, sv, clk_off, clk_dr, clk_drr, data) = frame.as_eph()
+                    .unwrap();
+                 
+            }
+        }
+    }
+    lines.push_str("\n");
+    write!(writer, "{}", lines)
+}*/
+
+/*
+fn write_epoch_v4 (
+        epoch: &Epoch, 
+        data: &BTreeMap<FrameClass, Vec<Frame>>,
+        header: &header::Header,
+        writer: &mut BufferedWriter,
+    ) -> std::io::Result<()> {
+    Ok(())
+}*/
+
+/*
     for (epoch, sv) in record.iter() {
         let nb_sv = sv.keys().len();
         match header.version.major {
@@ -608,42 +619,11 @@ pub fn to_file (header: &header::Header, record: &Record, mut writer: std::fs::F
         }*/
     }
     Ok(())
-}
+}*/
 
 #[cfg(test)]
 mod test {
     use super::*;
-    #[test]
-    fn test_complex_enum() {
-        let e = ComplexEnum::U8(10);
-        assert_eq!(e.as_u8().is_some(), true);
-        assert_eq!(e.as_f32().is_some(), false);
-        assert_eq!(e.as_str().is_some(), false);
-        let u = e.as_u8().unwrap();
-        assert_eq!(u, 10);
-        
-        let e = ComplexEnum::Str(String::from("Hello World"));
-        assert_eq!(e.as_u8().is_some(), false);
-        assert_eq!(e.as_f32().is_some(), false);
-        assert_eq!(e.as_str().is_some(), true);
-        let u = e.as_str().unwrap();
-        assert_eq!(u, "Hello World");
-        
-        let e = ComplexEnum::F32(10.0);
-        assert_eq!(e.as_u8().is_some(), false);
-        assert_eq!(e.as_f32().is_some(), true);
-        assert_eq!(e.as_str().is_some(), false);
-        let u = e.as_f32().unwrap();
-        assert_eq!(u, 10.0_f32);
-        
-        let e = ComplexEnum::F64(10.0);
-        assert_eq!(e.as_u8().is_some(), false);
-        assert_eq!(e.as_f32().is_some(), false);
-        assert_eq!(e.as_f64().is_some(), true);
-        assert_eq!(e.as_str().is_some(), false);
-        let u = e.as_f64().unwrap();
-        assert_eq!(u, 10.0_f64);
-    }
     #[test]
     fn test_is_new_epoch() {
         // NAV V<3
@@ -690,7 +670,7 @@ mod test {
     1.292880712890D+04-2.049269676210D+00 0.000000000000D+00 1.000000000000D+00
     2.193169775390D+04 1.059645652770D+00-9.313225746150D-10 0.000000000000D+00";
         let version = Version::new(2, 0);
-        let entry = build_record_entry(version, Constellation::Glonass, content);
+        let entry = parse_epoch(version, Constellation::Glonass, content);
         assert_eq!(entry.is_ok(), true);
         let (epoch, class, frame) = entry.unwrap();
         assert_eq!(epoch, Epoch {
@@ -727,10 +707,8 @@ mod test {
                 let v = v.unwrap();
                 assert_eq!(v, 3.725290298460E-09);
             } else if k.eq("health") {
-                let v = v.as_f64();
+                let v = v.as_glo_health();
                 assert_eq!(v.is_some(), true);
-                let v = v.unwrap();
-                assert_eq!(v, 0.0);
             } else if k.eq("satPosY") {
                 let v = v.as_f64();
                 assert_eq!(v.is_some(), true);
@@ -746,11 +724,11 @@ mod test {
                 assert_eq!(v.is_some(), true);
                 let v = v.unwrap();
                 assert_eq!(v, 0.0);
-            } else if k.eq("freqNum") {
-                let v = v.as_f64();
+            } else if k.eq("channel") {
+                let v = v.as_i8();
                 assert_eq!(v.is_some(), true);
                 let v = v.unwrap();
-                assert_eq!(v, 1.0);
+                assert_eq!(v, 1);
             } else if k.eq("satPosZ") {
                 let v = v.as_f64();
                 assert_eq!(v.is_some(), true);
@@ -788,7 +766,7 @@ mod test {
       .200000000000e+01  .000000000000e+00 -.599999994133e-09 -.900000000000e-08
       .432000000000e+06  .000000000000e+00 0.000000000000e+00 0.000000000000e+00";
         let version = Version::new(3, 0);
-        let entry = build_record_entry(version, Constellation::Mixed, content);
+        let entry = parse_epoch(version, Constellation::Mixed, content);
         assert_eq!(entry.is_ok(), true);
         let (epoch, class, frame) = entry.unwrap();
         assert_eq!(epoch, Epoch {
@@ -954,7 +932,7 @@ mod test {
       .312000000000e+01  .000000000000e+00  .232830643654e-09  .000000000000e+00
       .469330000000e+06 0.000000000000e+00 0.000000000000e+00 0.000000000000e+00";
         let version = Version::new(3, 0);
-        let entry = build_record_entry(version, Constellation::Mixed, content);
+        let entry = parse_epoch(version, Constellation::Mixed, content);
         assert_eq!(entry.is_ok(), true);
         let (epoch, class, frame) = entry.unwrap();
         assert_eq!(epoch, Epoch {
@@ -1081,11 +1059,9 @@ mod test {
                 assert_eq!(v.is_some(), true);
                 let v = v.unwrap();
                 assert_eq!(v, 0.312000000000e+01);
-            } else if k.eq("svHealth") {
-                let v = v.as_f64();
+            } else if k.eq("health") {
+                let v = v.as_gal_health();
                 assert_eq!(v.is_some(), true);
-                let v = v.unwrap();
-                assert_eq!(v, 0.000000000000e+00);
             } else if k.eq("bgdE5aE1") {
                 let v = v.as_f64();
                 assert_eq!(v.is_some(), true);
@@ -1116,7 +1092,7 @@ mod test {
       .595546582031e+04  .278496932983e+01  .000000000000e+00  .500000000000e+01
       .214479208984e+05 -.131077289581e+01 -.279396772385e-08  .000000000000e+00";
         let version = Version::new(3, 0);
-        let entry = build_record_entry(version, Constellation::Mixed, content);
+        let entry = parse_epoch(version, Constellation::Mixed, content);
         assert_eq!(entry.is_ok(), true);
         let (epoch, class, frame) = entry.unwrap();
         assert_eq!(epoch, Epoch {
@@ -1153,10 +1129,8 @@ mod test {
                 let v = v.unwrap();
                 assert_eq!(v, 0.000000000000e+00);
             } else if k.eq("health") {
-                let v = v.as_f64();
+                let v = v.as_glo_health();
                 assert_eq!(v.is_some(), true);
-                let v = v.unwrap();
-                assert_eq!(v, 0.000000000000e+00);
             } else if k.eq("satPosY") {
                 let v = v.as_f64();
                 assert_eq!(v.is_some(), true);
@@ -1172,11 +1146,11 @@ mod test {
                 assert_eq!(v.is_some(), true);
                 let v = v.unwrap();
                 assert_eq!(v, 0.000000000000e+00);
-            } else if k.eq("freqNum") {
-                let v = v.as_f64();
+            } else if k.eq("channel") {
+                let v = v.as_i8();
                 assert_eq!(v.is_some(), true);
                 let v = v.unwrap();
-                assert_eq!(v, 0.500000000000e+01);
+                assert_eq!(v, 5);
             } else if k.eq("satPosZ") {
                 let v = v.as_f64();
                 assert_eq!(v.is_some(), true);

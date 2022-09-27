@@ -3,17 +3,21 @@
 use crate::leap;
 use crate::antex;
 use crate::clocks;
-use crate::version;
 //use crate::gnss_time;
+
 use crate::hardware;
 use crate::reader::BufferedReader;
 use crate::types::{Type, TypeError};
 use crate::merge::MergeError;
 use crate::meteo;
-use crate::observation;
 use crate::ionosphere;
+use crate::observation;
+use crate::version::Version;
+
 use crate::constellation;
-use crate::constellation::{Constellation, augmentation::Augmentation};
+use crate::constellation::{
+	Constellation, augmentation::Augmentation,
+};
 
 use thiserror::Error;
 use std::str::FromStr;
@@ -86,7 +90,7 @@ impl Default for MarkerType {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Header {
     /// revision for this `RINEX`
-    pub version: version::Version, 
+    pub version: Version, 
     /// type of `RINEX` file
     pub rinex_type: Type, 
     /// specific `GNSS` constellation system,
@@ -208,7 +212,7 @@ pub enum Error {
 impl Default for Header {
     fn default() -> Header {
         Header {
-            version: version::Version::default(), 
+            version: Version::default(), 
             rinex_type: Type::default(),
             constellation: Some(Constellation::default()),
             comments: Vec::new(),
@@ -260,13 +264,13 @@ impl Default for Header {
 }
 
 impl Header {
-    /// Builds a `Header` from local file and previously grabbed 1st line
+    /// Builds a `Header` from local file
     pub fn new (reader: &mut BufferedReader) -> Result<Header, Error> { 
         let mut crinex : Option<observation::Crinex> = None;
-        let mut crnx_version = version::Version::default(); 
+        let mut crnx_version = Version::default(); 
         let mut rinex_type = Type::default();
         let mut constellation : Option<Constellation> = None;
-        let mut version = version::Version::default();
+        let mut version = Version::default();
         let mut comments   : Vec<String> = Vec::new();
         let mut program    = String::new();
         let mut run_by     = String::new();
@@ -337,7 +341,7 @@ impl Header {
             /////////////////////////////////////
             } else if marker.contains("CRINEX VERS") {
                 let version = content.split_at(20).0;
-                crnx_version = version::Version::from_str(version.trim())?
+                crnx_version = Version::from_str(version.trim())?
             } else if marker.contains("CRINEX PROG / DATE") {
                 let (pgm, remainder) = content.split_at(20);
                 let (_, remainder) = remainder.split_at(20);
@@ -354,7 +358,7 @@ impl Header {
             ////////////////////////////////////////
             } else if marker.contains("ANTEX VERSION / SYST") {
                 let (vers, system) = content.split_at(8);
-                version = version::Version::from_str(vers.trim())?;
+                version = Version::from_str(vers.trim())?;
                 if let Ok(constell) = Constellation::from_str(system.trim()) {
                     constellation = Some(constell)
                 }
@@ -380,7 +384,7 @@ impl Header {
                 let (vers, rem) = line.split_at(20);
                 let (type_str, rem) = rem.split_at(20); 
                 let (system_str, _) = rem.split_at(20);
-                version = version::Version::from_str(vers.trim())?;
+                version = Version::from_str(vers.trim())?;
                 rinex_type = Type::from_str(type_str.trim())?;
                 if rinex_type != Type::IonosphereMaps {
                     return Err(Error::FaultyIonexDescription)
@@ -412,7 +416,7 @@ impl Header {
                         constellation = Some(constell)
                     }
                 }
-                version = version::Version::from_str(vers.trim())?;
+                version = Version::from_str(vers.trim())?;
                 if !version.is_supported() {
                     return Err(Error::VersionNotSupported(vers.to_string()))
                 }
@@ -1382,17 +1386,26 @@ impl Header {
     }
 
     /// Creates a Basic Header structure
-    /// for NAV RINEX
+    /// for Mixed Constellation Navigation RINEX
     pub fn basic_nav() -> Self {
         Self::default()
             .with_type(Type::NavigationData)
+            .with_constellation(Constellation::Mixed)
     }
     
     /// Creates a Basic Header structure
-    /// for OBS RINEX
+    /// for Mixed Constellation Observation RINEX
     pub fn basic_obs() -> Self {
         Self::default()
             .with_type(Type::ObservationData)
+            .with_constellation(Constellation::Mixed)
+    }
+
+    /// Returns Header structure with specific RINEX revision
+    pub fn with_version(&self, version: Version) -> Self {
+        let mut s = self.clone();
+        s.version = version;
+        s
     }
 
     /// Returns Header structure with desired RINEX type
@@ -1454,8 +1467,11 @@ impl std::fmt::Display for Header {
     /// `header` formatter, mainly for 
     /// `RINEX` file production purposes
     fn fmt (&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        if self.is_crinex() {
-            // two special header lines
+        // start with CRINEX attributes, if need be
+        if let Some(obs) = &self.obs {
+            if let Some(crinex) = &obs.crinex {
+                write!(f, "{}", crinex)?;
+            }
         }
         // RINEX VERSION / TYPE 
         write!(f, "{:6}.{:02}           ", self.version.major, self.version.minor)?;
@@ -1519,19 +1535,20 @@ impl std::fmt::Display for Header {
         write!(f, "{}", "MARKER NUMBER\n")?;
         // ANT
         if let Some(ant) = &self.ant {
-            write!(f, "{:<20}", ant.sn)?;
-            write!(f, "{:<40}", ant.model)?;
+            write!(f, "{:<20}", ant.model)?;
+            write!(f, "{:<40}", ant.sn)?;
             write!(f, "{}", "ANT # / TYPE\n")?;
             if let Some(coords) = &ant.coords {
-                write!(f, "{:<20}", coords.x)?;
-                write!(f, "{:<20}", coords.y)?;
-                write!(f, "{:<20}", coords.z)?;
+                write!(f, "{:14.4}", coords.x)?;
+                write!(f, "{:14.4}", coords.y)?;
+                write!(f, "{:14.4}", coords.z)?;
                 write!(f, "{}", "APPROX POSITION XYZ\n")?
             }
             if let Some(h) = &ant.height {
-                write!(f, "{:<20}", h)?;
-                write!(f, "{:<20}", ant.eastern_ecc.unwrap_or(0.0_f32))?;
-                write!(f, "{:<20}", ant.northern_ecc.unwrap_or(0.0_f32))?;
+                write!(f, "{:14.4}", h)?;
+                write!(f, "{:14.4}", ant.eastern_ecc.unwrap_or(0.0_f32))?;
+                write!(f, "{:14.4}", ant.northern_ecc.unwrap_or(0.0_f32))?;
+                write!(f, "{:18}", "")?;
                 write!(f, "{}", "ANTENNA: DELTA H/E/N\n")?
             }
         }
@@ -1548,27 +1565,35 @@ impl std::fmt::Display for Header {
             write!(f, "{:<50}", "")?;
             write!(f, "INTERVAL\n")?
         }
-        // OBS codes
+        // List of Observables
         match self.rinex_type {
             Type::ObservationData => {
                 if let Some(obs) = &self.obs {
                     match self.version.major {
                         1|2 => { // old revisions
-                            for (_constell, codes) in obs.codes.iter() {
-                                let mut line = format!("{:6}", codes.len()); 
-                                for i in 0..codes.len() {
-                                    if (i+1)%10 == 0 {
-                                        line.push_str("# / TYPES OF OBS\n");
+                            for (_, observables) in obs.codes.iter() {
+                                write!(f, "{:6}", observables.len())?; 
+                                let mut line = String::new();
+                                for i in 0..observables.len() {
+                                    if (i % 9) == 0 && i > 0 {
+                                        line.push_str("# / TYPES OF OBSERV\n");
                                         write!(f, "{}", line)?;
                                         line.clear();
-                                        line.push_str(&format!("{:<6}", ""));
+                                        line.push_str(&format!("{:6}", "")); // tab
                                     }
-                                    line.push_str(&format!(" {:>5}", codes[i]));
+                                    line.push_str(&format!("{:>6}", observables[i]));
                                 }
-                                line.push_str(&format!("{:<width$}", "", width=60-line.len()));
-                                line.push_str("# / TYPES OF OBS\n"); 
-                                write!(f, "{}", line)?;
-                                break // only once
+                                if line.len() > 0 { // residues
+                                    if observables.len() > 9 {
+                                        line.push_str(&format!("{:<width$}", "", width=60-line.len()));
+                                    } else {
+                                        line.push_str(&format!("{:<width$}", "", width=54-line.len()));
+                                    }
+                                    line.push_str("# / TYPES OF OBSERV\n");
+                                    //line.push_str(&format!("{:>width$}", "# / TYPES OF OBSERV\n", width=74-line.len()));
+                                    write!(f, "{}", line)?
+                                }
+                                break ; // run only once, <=> for 1 constellation
                             }
                         },
                         _ => { // modern revisions
@@ -1591,48 +1616,50 @@ impl std::fmt::Display for Header {
                             }
                         },
                     }
-                } else {
-                    panic!("Observation RINEX with no `obs codes` specified")
                 }
-            },
+            }, //ObservationData
             Type::MeteoData => {
                 if let Some(obs) = &self.meteo {
-                    let codes = &obs.codes;
-                    let mut line = format!("{:6}", codes.len()); 
-                    for i in 0..codes.len() {
-                        if (i+1)%9 == 0 {
-                            line.push_str("# / TYPES OF OBS\n");
+                    write!(f, "{:6}", obs.codes.len())?; 
+                    let mut line = String::new();
+                    for i in 0..obs.codes.len() {
+                        if (i % 9) == 0 && i > 0 {
+                            line.push_str("# / TYPES OF OBSERV\n");
                             write!(f, "{}", line)?;
                             line.clear();
-                            line.push_str(&format!("{:<6}", ""));
+                            line.push_str(&format!("{:6}", "")); // tab
                         }
-                        line.push_str(&format!(" {:>5}", codes[i]));
+                        line.push_str(&format!("{:>6}", obs.codes[i]));
                     }
-                    line.push_str(&format!("{:<width$}", "", width=60-line.len()));
-                    line.push_str("# / TYPES OF OBS\n"); 
-                    write!(f, "{}", line)?;
-                } else {
-                    panic!("Meteo RINEX with no `obs codes` specified")
+                    if line.len() > 0 { // residues
+                        if obs.codes.len() > 9 {
+                            line.push_str(&format!("{:<width$}", "", width=60-line.len()));
+                        } else {
+                            line.push_str(&format!("{:<width$}", "", width=54-line.len()));
+                        }
+                        line.push_str("# / TYPES OF OBSERV\n");
+                    }
+                    write!(f, "{}", line)?
                 }
-            },
+            },//meteo data
             _ => {},
         }
         // LEAP
         if let Some(leap) = &self.leap {
-            write!(f, "{:6}", leap.leap)?;
+            let mut line = String::new();
+            line.push_str(&format!("{:6}", leap.leap));
             if let Some(delta) = &leap.delta_tls {
-                write!(f, "{:6}", delta)?;
-                write!(f, "{:6}", leap.week.unwrap_or(0))?;
-                write!(f, "{:6}", leap.day.unwrap_or(0))?;
+                line.push_str(&format!("{:6}", delta));
+                line.push_str(&format!("{:6}", leap.week.unwrap_or(0)));
+                line.push_str(&format!("{:6}", leap.day.unwrap_or(0)));
                 if let Some(system) = &leap.system {
-                    write!(f, "{:<10}", system.to_3_letter_code())?
+                    line.push_str(&format!("{:<10}", system.to_3_letter_code()));
                 } else {
-                    write!(f, "{:<10}", " ")?
+                    line.push_str(&format!("{:<10}", ""));
                 }
-            } else {
-                write!(f, "{:<40}", " ")?
             }
-            write!(f, "LEAP SECONDS\n")?
+            line.push_str(&format!("{:>width$}", "LEAP SECONDS\n", width=73-line.len()));
+            write!(f, "{}", line)?
         }
         // SENSOR(s)
         if let Some(meteo) = &self.meteo {

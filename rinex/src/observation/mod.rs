@@ -24,6 +24,20 @@ pub struct Crinex {
     pub date: chrono::NaiveDateTime,
 }
 
+impl std::fmt::Display for Crinex {
+    fn fmt (&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let version = self.version.to_string();
+        write!(f, "{:<width$}", version, width=20)?;
+        write!(f, "{:<width$}", "COMPACT RINEX FORMAT", width=20)?;
+        write!(f, "{value:<width$} CRINEX VERS   / TYPE\n", value="", width=19)?;
+        write!(f, "{:<width$}", self.prog, width=20)?;
+        write!(f, "{:20}", "")?;
+        let date = self.date.format("%d-%b-%y %H:%M");
+        write!(f, "{:<width$}", date, width=20)?;
+        f.write_str("CRINEX PROG / DATE\n")
+    }
+}
+
 /// Describes known marker types
 /// Observation Record specific header fields
 #[derive(Debug, Clone)]

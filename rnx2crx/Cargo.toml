@@ -1,16 +1,17 @@
 [package]
-name = "crx2rnx"
-version = "1.0.1"
+name = "rnx2crx"
+version = "0.0.1"
 license = "MIT OR Apache-2.0"
 authors = ["Guillaume W. Bres <guillaume.bressaix@gmail.com>"]
-description = "RINEX data decompressor"
+description = "RINEX data compressor"
 homepage = "https://github.com/gwbres/rinex"
-keywords = ["rinex", "compression", "decompression", "crinex"] 
+keywords = ["rinex", "compression", "crinex"] 
 categories = ["science", "command-line-interface", "command-line-utilities"]
 edition = "2021"
 readme = "README.md"
 
 [dependencies]
+chrono = "0.4"
 thiserror = "1"
 clap = { version = "3.2.22", features = ["yaml"] }
 rinex = { path = "../rinex", features = ["serde"] }

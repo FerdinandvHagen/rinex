@@ -24,14 +24,23 @@ pub mod record;
 pub mod sv;
 pub mod types;
 pub mod version;
-pub mod reader;
 
+extern crate num;
+#[macro_use]
+extern crate num_derive;
+
+pub mod reader;
 use reader::BufferedReader;
-use std::io::{Read, Write};
+use std::io::{Write}; //, Read};
+
+pub mod writer;
+use writer::BufferedWriter;
 
 use thiserror::Error;
 use chrono::{Datelike, Timelike};
 use std::collections::{BTreeMap, HashMap};
+
+use navigation::DbItem;
 
 #[cfg(feature = "serde")]
 #[macro_use]
@@ -323,6 +332,7 @@ impl Rinex {
     /// some are mandatory.   
     /// Parses record (file body) for supported `RINEX` types.
     pub fn from_file (path: &str) -> Result<Rinex, Error> {
+        /* This will be required if we have make the BufferedReader Hatanaka compliant
         // Grab first 80 bytes to fully determine the BufferedReader attributes.
         // We use the `BufferedReader` wrapper for efficient file browsing (.lines())
         // and builtin CRINEX decompression 
@@ -338,7 +348,7 @@ impl Rinex {
             } else {
                 panic!("header 1st line is not valid Utf8 encoding")
             }
-        }
+        }*/
 
 /*
  *      deflate (.gzip) fd pointer does not work / is not fully supported
@@ -349,23 +359,15 @@ impl Rinex {
         reader.seek(SeekFrom::Start(0))
             .unwrap();
 */        
-        let mut reader = BufferedReader::new(path)?;
-
         // create buffered reader
-        if line.contains("CRINEX") {
-            // --> enhance buffered reader
-            //     with hatanaka M capacity
-            reader = reader.with_hatanaka(8)?; // M = 8 is more than enough
-                                            // `CRX2RNX` has M=5 builtin
-        }
-
+        let mut reader = BufferedReader::new(path)?;
         // --> parse header fields 
         let header = header::Header::new(&mut reader)
             .unwrap();
         // --> parse record (file body)
         //     we also grab encountered comments,
         //     they might serve some fileops like `splice` / `merge` 
-        let (record, comments) = record::build_record(&mut reader, &header)
+        let (record, comments) = record::parse_record(&mut reader, &header)
             .unwrap();
         Ok(Rinex {
             header,
@@ -1541,7 +1543,9 @@ impl Rinex {
     /// For Observation record: "C1C", "L1C", ..., any valid 3 letter observable.
     /// For Meteo record: "PR", "HI", ..., any valid 2 letter sensor physics.
     /// For Navigation record:
-    ///   - Ephemeris: MsgType filter: "LNAV", "FDMA", "D1D2", "CNVX, ... any valid [MsgType]
+    ///   - Ephemeris: this acts as a key/dictionary filter. 
+	///     Example of known keys would be "health", "idot", "iode"..
+	///     Any known data identifier is accepted.
     ///   - Ionospheric Model: does not apply
     ///   - System Time offset: "GPUT", "GAGP", ..., any valid system time
     /// For Clock record: we consider filter items as Data Type Codes "AR","AS"...
@@ -1554,14 +1558,16 @@ impl Rinex {
     /// rinex
     ///     .observable_filter_mut(vec!["C1C","C2P"]);
     /// ```
-/*    ///
+	///
     /// Navigation record example:
     /// ```
     /// use rinex::*;
-    /// let mut rinex = Rinex::from_file("../test_resources/NAV/V4/KMS300DNK_R_20221591000_01H_MN.rnx.gz").unwrap();
+    /// let mut rinex = Rinex::from_file(
+	///     "../test_resources/NAV/V4/KMS300DNK_R_20221591000_01H_MN.rnx.gz")
+	///		.unwrap();
     /// rinex
-    ///     .observable_filter_mut(vec!["FDMA","LNAV"]);
-    /// ```*/
+    ///     .observable_filter_mut(vec!["idot","iode"]);
+    /// ```
     pub fn observable_filter_mut (&mut self, filter: Vec<&str>) {
         if self.is_navigation_rinex() {
             let record = self.record
@@ -1571,16 +1577,20 @@ impl Rinex {
                 .retain(|_, classes| {
                     classes.retain(|class, frames| {
                         if *class == navigation::record::FrameClass::Ephemeris {
-                            frames.retain(|fr| {
-                                let (msg_type, _, _, _, _, _) = fr.as_eph().unwrap();
-                                filter.contains(&msg_type.to_string().as_str())
+                            frames.retain_mut(|fr| {
+                                let (_, _, _, _, _, map) = fr
+									.as_mut_eph()
+									.unwrap();
+								map.retain(|k, _| filter.contains(&k.as_str())); // dictionary key filter
+								map.len() > 0 // got some leftovers
                             });
-                        } else if *class == navigation::record::FrameClass::SystemTimeOffset {
+                        }/*  TODO: can this apply to non ephemeris data please ?
+						else if *class == navigation::record::FrameClass::SystemTimeOffset {
                             frames.retain(|fr| {
                                 let fr = fr.as_sto().unwrap();
                                 filter.contains(&fr.system.as_str())
                             });
-                        }
+                        }*/
                         frames.len() > 0
                     });
                     classes.len() > 0
@@ -1796,11 +1806,11 @@ impl Rinex {
     ///     } 
     /// }
     /// ```
-    pub fn ephemeris (&self) -> BTreeMap<epoch::Epoch, BTreeMap<sv::Sv, (f64,f64,f64, HashMap<String, navigation::record::ComplexEnum>)>> {
+    pub fn ephemeris (&self) -> BTreeMap<epoch::Epoch, BTreeMap<sv::Sv, (f64,f64,f64, HashMap<String, DbItem>)>> {
         if !self.is_navigation_rinex() {
             return BTreeMap::new() ; // nothing to browse
         }
-        let mut results: BTreeMap<epoch::Epoch, BTreeMap<sv::Sv, (f64,f64,f64, HashMap<String, navigation::record::ComplexEnum>)>>
+        let mut results: BTreeMap<epoch::Epoch, BTreeMap<sv::Sv, (f64,f64,f64, HashMap<String, DbItem>)>>
             = BTreeMap::new();
         let record = self.record
             .as_nav()
@@ -1808,7 +1818,7 @@ impl Rinex {
         for (e, classes) in record.iter() {
             for (class, frames) in classes.iter() {
                 if *class == navigation::record::FrameClass::Ephemeris {
-                    let mut inner: BTreeMap<sv::Sv,  (f64,f64,f64, HashMap<String, navigation::record::ComplexEnum>)> = BTreeMap::new();
+                    let mut inner: BTreeMap<sv::Sv,  (f64,f64,f64, HashMap<String, DbItem>)> = BTreeMap::new();
                     for frame in frames.iter() {
                         let (_, sv, clk, clk_dr, clk_drr, map) = frame.as_eph().unwrap();
                         inner.insert(sv, (clk, clk_dr, clk_drr, map.clone()));
@@ -3341,10 +3351,10 @@ CYCLE SLIPS CONFIRMATION
     /// Both header + record will strictly follow RINEX standards.   
     /// Record: refer to supported RINEX types
     pub fn to_file (&self, path: &str) -> std::io::Result<()> {
-        let mut writer = std::fs::File::create(path)?;
+		let mut writer = BufferedWriter::new(path)?;
         write!(writer, "{}", self.header.to_string())?;
         self.record
-            .to_file(&self.header, writer)
+            .to_file(&self.header, &mut writer)
     }
 }
 

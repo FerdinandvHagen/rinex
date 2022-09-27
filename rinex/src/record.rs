@@ -8,13 +8,15 @@ use crate::epoch;
 use crate::meteo;
 use crate::clocks;
 use crate::header;
-use crate::hatanaka;
 use crate::navigation;
 use crate::observation;
 use crate::ionosphere;
 use crate::is_comment;
 use crate::types::Type;
+
+use crate::hatanaka::Decompressor;
 use crate::reader::BufferedReader;
+use crate::writer::BufferedWriter;
 
 #[cfg(feature = "serde")]
 use serde::Serialize;
@@ -23,26 +25,17 @@ use serde::Serialize;
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum Record {
-    /// ATX record, list of Antenna caracteristics,
-    /// sorted by antenna model. ATX record is not
-    /// epoch iterable
+    /// ATX record, see [antex::record::Record] 
     AntexRecord(antex::record::Record),
-    /// `clocks::Record` : CLOCKS RINEX file content
+    /// Clock record, see [clocks::record::Record] 
     ClockRecord(clocks::record::Record),
-    /// `IONEX` record is a list of Ionosphere Maps,
-    /// sorted by `epoch`
+	/// IONEX (ionosphere maps) record
     IonexRecord(ionosphere::record::Record),
-    /// `meteo::Record` : Meteo Data file content.   
-	/// `record` is a list of raw data sorted by Observable,
-    /// and by `epoch`
+	/// Meteo record, see [meteo::record::Record]
     MeteoRecord(meteo::record::Record),
-	/// `navigation::Record` : Navigation Data file content.    
-	/// `record` is a list of `navigation::ComplexEnum` sorted
-	/// by `epoch` and by `Sv`
+	/// Navigation record, see [navigation::record::Record]
     NavRecord(navigation::record::Record),
-	/// `observation::Record` : Observation Data file content.   
-	/// `record` is a list of `observation::ObservationData` indexed
-	/// by Observation code, sorted by `epoch` and by `Sv`
+	/// Observation record, see [observation::record::Record]
     ObsRecord(observation::record::Record),
 }
 
@@ -137,25 +130,32 @@ impl Record {
         }
     }
     /// Streams into given file writer
-    pub fn to_file (&self, header: &header::Header, writer: std::fs::File) -> std::io::Result<()> {
+    pub fn to_file (&self, header: &header::Header, writer: &mut BufferedWriter) -> std::io::Result<()> {
         match &header.rinex_type {
             Type::MeteoData => {
                 let record = self.as_meteo()
                     .unwrap();
-                Ok(meteo::record::to_file(header, &record, writer)?)
+                for (epoch, data) in record.iter() {
+                    meteo::record::write_epoch(epoch, data, header, writer)?
+                }
             },
             Type::ObservationData => {
                 let record = self.as_obs()
                     .unwrap();
-                Ok(observation::record::to_file(header, &record, writer)?)
+                for (epoch, (clock_offset, data)) in record.iter() {
+                    observation::record::write_epoch(epoch, clock_offset, data, header, writer)?
+                }
             },
             Type::NavigationData => {
                 let record = self.as_nav()
                     .unwrap();
-                Ok(navigation::record::to_file(header, &record, writer)?)
+                for (epoch, classes) in record.iter() {
+                    navigation::record::write_epoch(epoch, classes, header, writer)?
+                }
             },
             _ => panic!("record type not supported yet"),
         }
+        Ok(())
     }
 }
 
@@ -191,7 +191,7 @@ pub fn is_new_epoch (line: &str, header: &header::Header) -> bool {
 
 /// Builds a `Record`, `RINEX` file body content,
 /// which is constellation and `RINEX` file type dependent
-pub fn build_record (reader: &mut BufferedReader, header: &header::Header) -> Result<(Record, Comments), Error> {
+pub fn parse_record (reader: &mut BufferedReader, header: &header::Header) -> Result<(Record, Comments), Error> {
     let mut first_epoch = true;
     let mut content : Option<String>; // epoch content to build
     let mut epoch_content = String::with_capacity(6*64);
@@ -210,7 +210,7 @@ pub fn build_record (reader: &mut BufferedReader, header: &header::Header) -> Re
     } else {
         false
     };
-    let mut decompressor = hatanaka::Decompressor::new(8);
+    let mut decompressor = Decompressor::new();
     // record 
     let mut atx_rec = antex::record::Record::new(); // ATX
     let mut nav_rec = navigation::record::Record::new(); // NAV
@@ -240,7 +240,7 @@ pub fn build_record (reader: &mut BufferedReader, header: &header::Header) -> Re
         // manage CRINEX case
         //  [1]  RINEX : pass content as is
         //  [2] CRINEX : decompress
-        //           --> decompressed content may wind up as more than one line
+        //           --> decompressed content will probably wind up as more than one line
         content = match crinex {
             false => Some(line.to_string()), 
             true => {
@@ -273,7 +273,7 @@ pub fn build_record (reader: &mut BufferedReader, header: &header::Header) -> Re
                     match &header.rinex_type {
                         Type::NavigationData => {
                             let constellation = &header.constellation.unwrap();
-                            if let Ok((e, class, fr)) = navigation::record::build_record_entry(header.version, *constellation, &epoch_content) {
+                            if let Ok((e, class, fr)) = navigation::record::parse_epoch(header.version, *constellation, &epoch_content) {
                                 if let Some(e) = nav_rec.get_mut(&e) {
                                     // epoch already encountered
                                     if let Some(frames) = e.get_mut(&class) {
@@ -296,19 +296,19 @@ pub fn build_record (reader: &mut BufferedReader, header: &header::Header) -> Re
                             }
                         },
                         Type::ObservationData => {
-                            if let Ok((e, ck_offset, map)) = observation::record::build_record_entry(&header, &epoch_content) {
+                            if let Ok((e, ck_offset, map)) = observation::record::parse_epoch(&header, &epoch_content) {
                                 obs_rec.insert(e, (ck_offset, map));
                                 comment_ts = e.clone(); // for comments classification & management
                             }
                         },
                         Type::MeteoData => {
-                            if let Ok((e, map)) = meteo::record::build_record_entry(&header, &epoch_content) {
+                            if let Ok((e, map)) = meteo::record::parse_epoch(&header, &epoch_content) {
                                 met_rec.insert(e, map);
                                 comment_ts = e.clone(); // for comments classification & management
                             }
                         },
                         Type::ClockData => {
-                            if let Ok((epoch, dtype, system, data)) = clocks::record::build_record_entry(header.version, &epoch_content) {
+                            if let Ok((epoch, dtype, system, data)) = clocks::record::parse_epoch(header.version, &epoch_content) {
                                 if let Some(e) = clk_rec.get_mut(&epoch) {
                                     if let Some(d) = e.get_mut(&dtype) {
                                         d.insert(system, data);
@@ -330,7 +330,7 @@ pub fn build_record (reader: &mut BufferedReader, header: &header::Header) -> Re
                             }
                         },
                         Type::AntennaData => {
-                            if let Ok((antenna, frequencies)) = antex::record::build_record_entry(&epoch_content) {
+                            if let Ok((antenna, frequencies)) = antex::record::parse_epoch(&epoch_content) {
                                 let mut found = false;
                                 for (ant, freqz) in atx_rec.iter_mut() {
                                     if *ant == antenna {
@@ -347,7 +347,7 @@ pub fn build_record (reader: &mut BufferedReader, header: &header::Header) -> Re
                             }
                         },
                         Type::IonosphereMaps => {
-                            if let Ok((epoch, map)) = ionosphere::record::build_record_entry(&epoch_content, exponent) {
+                            if let Ok((epoch, map)) = ionosphere::record::parse_epoch(&epoch_content, exponent) {
                                 ionx_rec.insert(epoch, (map, None, None));
                             }
                         }
@@ -379,7 +379,7 @@ pub fn build_record (reader: &mut BufferedReader, header: &header::Header) -> Re
     match &header.rinex_type {
         Type::NavigationData => {
             let constellation = &header.constellation.unwrap();
-            if let Ok((e, class, fr)) = navigation::record::build_record_entry(header.version, *constellation, &epoch_content) {
+            if let Ok((e, class, fr)) = navigation::record::parse_epoch(header.version, *constellation, &epoch_content) {
                 if let Some(e) = nav_rec.get_mut(&e) {
                     // epoch already encountered
                     if let Some(frames) = e.get_mut(&class) {
@@ -402,19 +402,19 @@ pub fn build_record (reader: &mut BufferedReader, header: &header::Header) -> Re
             }
         },
         Type::ObservationData => {
-            if let Ok((e, ck_offset, map)) = observation::record::build_record_entry(&header, &epoch_content) {
+            if let Ok((e, ck_offset, map)) = observation::record::parse_epoch(&header, &epoch_content) {
                 obs_rec.insert(e, (ck_offset, map));
                 comment_ts = e.clone(); // for comments classification + management
             }
         },
         Type::MeteoData => {
-            if let Ok((e, map)) = meteo::record::build_record_entry(&header, &epoch_content) {
+            if let Ok((e, map)) = meteo::record::parse_epoch(&header, &epoch_content) {
                 met_rec.insert(e, map);
                 comment_ts = e.clone(); // for comments classification + management
             }
         },
         Type::ClockData => {
-            if let Ok((e, dtype, system, data)) = clocks::record::build_record_entry(header.version, &epoch_content) {
+            if let Ok((e, dtype, system, data)) = clocks::record::parse_epoch(header.version, &epoch_content) {
                 // Clocks `RINEX` files are handled a little different,
                 // because we parse one line at a time, while we parsed one epoch at a time for other RINEXes.
                 // One line may contribute to a previously existing epoch in the record 
@@ -441,12 +441,12 @@ pub fn build_record (reader: &mut BufferedReader, header: &header::Header) -> Re
             }
         },
         Type::IonosphereMaps => {
-            if let Ok((epoch, maps)) = ionosphere::record::build_record_entry(&epoch_content, exponent) {
+            if let Ok((epoch, maps)) = ionosphere::record::parse_epoch(&epoch_content, exponent) {
                 ionx_rec.insert(epoch, (maps, None, None));
             }
         }
         Type::AntennaData => {
-            if let Ok((antenna, frequencies)) = antex::record::build_record_entry(&epoch_content) {
+            if let Ok((antenna, frequencies)) = antex::record::parse_epoch(&epoch_content) {
                 let mut found = false;
                 for (ant, freqz) in atx_rec.iter_mut() {
                     if *ant == antenna {
