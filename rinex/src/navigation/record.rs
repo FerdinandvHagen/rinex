@@ -372,6 +372,7 @@ fn build_modern_record_entry (content: &str) ->
             let clk = f64::from_str(clk_bias.replace("D","E").trim())?;
             let clk_dr = f64::from_str(clk_dr.replace("D","E").trim())?;
             let clk_drr = f64::from_str(clk_drr.replace("D","E").trim())?;
+
             let map = parse_complex_map(
                 Version { major: 4, minor: 0 },
                 sv.constellation,
@@ -462,7 +463,7 @@ fn build_v2_v3_record_entry (version: Version, constell: Constellation, content:
     };
 
     let (svnn, rem) = line.split_at(svnn_offset);
-    let (date, rem) = rem.split_at(20);
+    let (date, rem) = rem.split_at(19);
     let (clk_bias, rem) = rem.split_at(19);
     let (clk_dr, clk_drr) = rem.split_at(19);
 
