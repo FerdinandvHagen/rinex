@@ -492,10 +492,9 @@ pub fn parse_epoch (header: &header::Header, content: &str)
 				'C' => Constellation::BeiDou,
 				//'H' => Constellation::SBAS(Augmentation::default()),
                 'S' => Constellation::SBAS(Augmentation::default()),
-				_ => return Err(
-                        Error::SvError(
-                            sv::Error::ConstellationError(
-                                constellation::Error::UnknownCode(identifier.to_string())))),
+				_ => {
+                    continue
+                },
 			};
 			let sv = sv::Sv::new(constell, prn);
 			// retrieve obs code for that system
@@ -544,8 +543,9 @@ pub fn parse_epoch (header: &header::Header, content: &str)
 				if let Some(obs) = obs { // parsed something
 					let obs = ObservationData::new(obs, lli, ssi);
 					obs_map.insert(code.to_string(), obs);
-					code_index += 1;
 				}
+
+                code_index += 1;
 				
 				offset += 14 // F14.3
 					+1  // +lli
